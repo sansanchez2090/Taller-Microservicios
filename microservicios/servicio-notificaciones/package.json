@@ -1,12 +1,9 @@
 {
-  "name": "servicio-notificaciones",
+  "name": "gateway",
   "version": "1.0.0",
-  "description": "Microservicio de notificaciones de la pizzeria. Avisa cuando un pedido se confirma. (Lo completa el estudiante en la Seccion 13).",
+  "description": "Punto de entrada unico (API Gateway)",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2"
-  }
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.19.2" }
 }

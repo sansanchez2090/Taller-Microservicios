@@ -1,497 +1,148 @@
-# Taller de Microservicios y Serverless — La Pizzería
-
-Trabaja siguiendo las actividades en orden y responde las preguntas en `respuestas/respuestas.md`.
-
-## Objetivos
-
-- Ejecutar y probar un sistema de microservicios.
-- Observar la comunicación entre servicios por HTTP.
-- Ver el comportamiento ante fallos (sin stock, servicio caído, timeout).
-- Completar y probar un microservicio nuevo.
-- Consumir una función Serverless y compararla con los microservicios.
-
-## Contexto
-
-### Microservicios
-
-El sistema está dividido en servicios independientes, cada uno con una
-responsabilidad distinta, que se comunican por HTTP.
-
+# Guía del laboratorio — Microservicios y Serverless (Pizzería)
+ 
+Duración estimada: 2 horas · Requisitos: Node.js 18+, `curl` (en Windows `curl.exe`).
+ 
+## Arquitectura
+ 
 ```text
-Cliente
-   ↓
-Pedidos       (3001)
-   ↓
-Inventario    (3002)
-   ↓
-Pagos         (3003)
-   ↓
-Pedido confirmado
+                       ┌──────────────────┐
+  cliente ───────────► │ gateway  :3000   │  (punto de entrada único)
+                       └────────┬─────────┘
+                                │ enruta por prefijo
+        ┌───────────────────────┼──────────────────────┐
+        ▼                       ▼                      ▼
+ ┌───────────────┐      ┌───────────────┐      ┌─────────────────┐
+ │ pedidos :3001 │─────►│ inventario    │      │ notificaciones  │
+ │ (orquestador) │      │ :3002         │      │ :3004           │
+ │               │─────►┌───────────────┐      └─────────────────┘
+ │               │      │ pagos :3003   │               ▲
+ │               │──────┴───────────────┘               │
+ └───────┬───────┘───────────────────────────────────────┘
+         │
+   Flujo de POST /pedidos:
+   1) inventario/reservar   (crítico)
+   2) pagos                 (crítico; si falla → inventario/liberar)
+   3) notificaciones        (NO crítico; si falla el pedido sigue)
 ```
-
-- **Pedidos (3001):** recibe el pedido y coordina inventario y pagos.
-- **Inventario (3002):** controla el stock de cada pizza.
-- **Pagos (3003):** simula el cobro (siempre aprueba).
-
-### Estructura del proyecto
-
+ 
+Cada servicio tiene su propio proceso, su propio puerto y su propio estado en
+memoria. Solo se comunican por HTTP.
+ 
+---
+ 
+## Parte 1 — Levantar el sistema (15 min)
+ 
+1. Instala dependencias (`npm install`) en cada carpeta de `microservicios/`.
+2. Levanta **solo** `inventario` (3002), `pagos` (3003) y `pedidos` (3001), cada
+   uno en su terminal.
+3. Verifica que cada servicio responde:
 ```text
-taller-microservicios-serverless/
-├── microservicios/
-│   ├── servicio-pedidos/         (3001)
-│   ├── servicio-inventario/      (3002, incluye pizzas.json)
-│   ├── servicio-pagos/           (3003)
-│   ├── servicio-notificaciones/  (3004, lo completas tú)
-│   └── gateway/                  (3000, punto de entrada único que completas tú)
-├── serverless/
-│   └── funcion-pedido/
-├── respuestas/
-│   └── respuestas.md
-├── guia-taller.md
-└── README.md
+   curl.exe http://localhost:3002/health
+   curl.exe http://localhost:3003/health
+   curl.exe http://localhost:3001/health
 ```
-
-El gateway (`microservicios/gateway/`) se trabaja en la sección **API Gateway**.
-
-### Menú (pizzas.json)
-
-| Pizza | Precio | Stock inicial |
+ 
+## Parte 2 — Pruebas del flujo normal (15 min)
+ 
+1. Consulta el inventario inicial: `GET http://localhost:3002/inventario`.
+2. Crea un pedido: `POST http://localhost:3001/pedidos` con `{"pizza":"hawaiana"}`.
+3. Vuelve a consultar el inventario y lista los pedidos (`GET /pedidos`).
+4. Prueba una pizza inexistente (`{"pizza":"piña"}`).
+5. Agota el stock de `cuatro-quesos` (3 unidades) y haz un cuarto pedido.
+**Preguntas:** P1, P2.
+ 
+> Observa: el pedido se confirma aunque `servicio-notificaciones` aún **no está
+> levantado**. Fíjate en el campo `notificacion` de la respuesta.
+ 
+## Parte 3 — Fallos (30 min)
+ 
+Con el sistema completo en marcha (incluye la Parte 4 y 5 si ya las tienes),
+provoca cada fallo y **anota** el código HTTP, el mensaje, el estado del pedido
+y el inventario resultante.
+ 
+| # | Experimento | Cómo provocarlo |
 |---|---|---|
-| margarita | 18000 | 5 |
-| hawaiana | 22000 | 5 |
-| pepperoni | 24000 | 5 |
-| vegetariana | 21000 | 5 |
-| pollo | 23000 | 5 |
-
-### Endpoints
-
-| Servicio | Método | Ruta | Función |
-|---|---|---|---|
-| Pedidos | POST | `/pedidos` | Crear un pedido |
-| Inventario | GET | `/inventario` | Ver todo el inventario |
-| Inventario | GET | `/inventario/:pizza` | Ver una pizza |
-| Inventario | POST | `/inventario` | Reservar/descontar una pizza |
-| Pagos | POST | `/pagos` | Procesar un pago |
-| Notificaciones | POST | `/notificaciones` | Enviar notificación (Sección: cuarto microservicio) |
-| Gateway | (varias) | `/pedidos`, `/inventario`, `/pagos`, `/notificaciones` | Punto de entrada único que reenvía a cada servicio (Sección: API Gateway) |
-
-### Puertos del sistema
-
-| Componente | Puerto | Aparece en |
-|---|---|---|
-| servicio-pedidos | 3001 | Base |
-| servicio-inventario | 3002 | Base |
-| servicio-pagos | 3003 | Base |
-| servicio-notificaciones | 3004 | Cuarto microservicio |
-| gateway | 3000 | API Gateway |
-
-Requisito: Node.js 18 o superior.
-
----
-
-## 1. Preparar el proyecto
-
-Instala las dependencias de cada servicio:
-
+| F1 | Pago rechazado | `{"pizza":"margarita","tarjeta":"0000"}` |
+| F2 | `servicio-pagos` caído | Ctrl+C en su terminal |
+| F3 | `servicio-pagos` lento | Reinícialo con `LATENCIA_MS=5000` |
+| F4 | `servicio-notificaciones` caído | Ctrl+C en su terminal |
+| F5 | `servicio-inventario` caído | Ctrl+C en su terminal |
+ 
+Después de cada experimento, consulta `GET /inventario` y `GET /pedidos`.
+Reinicia el servicio antes del siguiente experimento.
+ 
+**Preguntas:** P3, P4, P5, P6.
+ 
+## Parte 4 — Completar `servicio-notificaciones` (20 min)
+ 
+Implementa el servicio en `microservicios/servicio-notificaciones/index.js`
+(puerto 3004). Requisitos:
+ 
+- `GET /health` → `{ servicio, estado: "ok" }`.
+- `POST /notificaciones` con `{ pedidoId, mensaje, canal? }`:
+  - 400 si falta `pedidoId` o `mensaje`.
+  - 400 si el `canal` no es `email`, `sms` o `whatsapp` (por defecto `email`).
+  - Guarda la notificación en memoria y responde **201**.
+- `GET /notificaciones` → historial, con filtro opcional `?pedidoId=`.
+Comprueba que, al levantarlo, `servicio-pedidos` pasa a registrar
+`notificacion: "enviada"` sin tocar el código de pedidos.
+ 
+**Pregunta:** P3 (vuelve a comparar).
+ 
+## Parte 5 — Completar el `gateway` (20 min)
+ 
+Implementa en `microservicios/gateway/index.js` (puerto 3000):
+ 
+- Enrutamiento por prefijo: `/pedidos`, `/inventario`, `/pagos`, `/notificaciones`.
+- Cabecera `X-Request-Id` y log de cada petición (método, ruta, estado, ms).
+- `502 Bad Gateway` si el servicio no responde y `504` si excede el timeout.
+- `GET /health` que agregue el estado de todos los servicios.
+- Extras: límite de peticiones por IP (429) y API key opcional (401).
+Repite las pruebas de la Parte 2 usando el puerto **3000** en lugar de 3001/3002,
+y observa qué ocurre con un servicio caído.
+ 
+**Pregunta:** P7.
+ 
+## Parte 6 — Función Serverless (20 min)
+ 
+1. Entra a `serverless/funcion-pedido`, ejecuta `npm install` y `node local.js`.
+2. Llama a la función:
 ```text
-cd microservicios/servicio-pedidos
-npm install
-
-cd ../servicio-inventario
-npm install
-
-cd ../servicio-pagos
-npm install
+   curl.exe -X POST http://localhost:4000/api/pedido -H "Content-Type: application/json" -d '{\"pizza\":\"hawaiana\"}'
 ```
-
+3. Prueba una pizza inválida y una petición `GET`.
+4. (Opcional) Despliégala en Vercel (`/api/pedido`) o Netlify
+   (`/.netlify/functions/pedido`) y mide el tiempo de la **primera** llamada y
+   el de las siguientes.
+5. Compara con `POST /pedidos` del microservicio: ¿qué hace una y qué no hace la otra?
+**Preguntas:** P8, P9.
+ 
+## Parte 7 — Reflexión final
+ 
+**Pregunta:** P10.
+ 
 ---
-
-## 2. Ejecutar los servicios
-
-Abre tres terminales y ejecuta un servicio en cada una:
-
-### Pedidos
-```text
-cd microservicios/servicio-pedidos
-node index.js
-```
-
-### Inventario
-```text
-cd microservicios/servicio-inventario
-node index.js
-```
-
-### Pagos
-```text
-cd microservicios/servicio-pagos
-node index.js
-```
-
-**Resultado esperado:** los tres servicios quedan ejecutándose en los puertos
-3001, 3002 y 3003, cada uno mostrando su mensaje de arranque.
-
-Para detener un servicio: `Ctrl + C` en su terminal.
-
----
-
-## 3. Realizar un pedido
-
-Envía un POST a `http://localhost:3001/pedidos` con el cuerpo
-`{ "pizza": "hawaiana" }`.
-
-**curl (PowerShell):**
-```text
-curl.exe -X POST http://localhost:3001/pedidos -H "Content-Type: application/json" -d '{\"pizza\":\"hawaiana\"}'
-```
-
-**curl (Mac/Linux):**
-```text
-curl -X POST http://localhost:3001/pedidos -H "Content-Type: application/json" -d '{"pizza":"hawaiana"}'
-```
-
-**Respuesta esperada:**
-```json
-{
-  "success": true,
-  "pedidoId": 1,
-  "pizza": "hawaiana",
-  "precio": 22000,
-  "stockRestante": 4,
-  "transaccion": "TX-889264",
-  "notificacion": null,
-  "message": "Pedido #1 de pizza hawaiana confirmado con exito."
-}
-```
-
----
-
-## Actividades — Microservicios
-
-Registra tus observaciones y responde en `respuestas/respuestas.md`.
-
-### Actividad 1 — Ejecutar los servicios
-
-1. Ejecuta `servicio-pedidos` en el puerto 3001.
-2. Ejecuta `servicio-inventario` en el puerto 3002.
-3. Ejecuta `servicio-pagos` en el puerto 3003.
-4. Verifica que los tres estén disponibles.
-5. Evidencia: captura de las tres terminales con los servicios corriendo.
-6. Responde la pregunta 1.
-
-### Actividad 2 — Realizar pedidos
-
-1. Realiza tres pedidos con pizzas distintas (por ejemplo `margarita`,
-   `pepperoni`, `pollo`).
-2. Verifica en cada respuesta: `pedidoId`, `precio`, `stockRestante`,
-   `transaccion`.
-3. Evidencia: captura de un pedido exitoso.
-4. Responde la pregunta 2.
-
-### Actividad 3 — Modificar inventario
-
-1. En `microservicios/servicio-inventario/pizzas.json`, cambia el `stock` de una
-   pizza (por ejemplo `vegetariana`) a `0` y guarda.
-2. Realiza un pedido de esa pizza.
-3. **Resultado esperado:** el pedido se rechaza (HTTP 409) con un mensaje de
-   inventario sin stock.
-4. Evidencia: captura del pedido rechazado.
-5. Responde la pregunta 3 (y ten en cuenta esta observación para la 5).
-6. Al terminar, vuelve a dejar el `stock` en `5` si vas a seguir probando.
-
-### Actividad 4 — Detener un servicio
-
-1. Detén `servicio-inventario` (`Ctrl + C`).
-2. Realiza un pedido de cualquier pizza.
-3. **Resultado esperado:** `servicio-pedidos` responde con error controlado
-   (HTTP 503) sin caerse.
-4. Evidencia: captura del error.
-5. Responde la pregunta 3.
-6. Vuelve a ejecutar `servicio-inventario` antes de continuar.
-
-### Actividad 5 — Timeout
-
-1. En `microservicios/servicio-pedidos/index.js`, localiza:
-   ```js
-   const TIMEOUT_MS = 5000;
-   ```
-2. Cámbialo a un valor menor, por ejemplo `1`.
-3. Guarda y reinicia `servicio-pedidos`.
-4. Realiza un pedido.
-5. **Resultado esperado:** el pedido probablemente falla (HTTP 503) por
-   superarse el timeout antes de recibir respuesta.
-6. Responde la pregunta 5.
-7. Restaura `const TIMEOUT_MS = 5000;`, guarda y reinicia `servicio-pedidos`.
-
----
-
-## Cuarto microservicio — servicio-notificaciones
-
-Responsabilidad del servicio: avisar cuando un pedido se confirma. Escucha en el
-puerto 3004 y expone `POST /notificaciones`.
-
-### Pasos
-
-1. Entra a `microservicios/servicio-notificaciones` e instala dependencias:
-   ```text
-   npm install
-   ```
-2. Abre `index.js`. El servidor y la ruta ya están, faltan los bloques marcados
-   como `COMPLETAR` dentro de `POST /notificaciones`.
-3. Completa las tres partes marcadas dentro de `POST /notificaciones`:
-   - Paso 1: leer `pedidoId` y `pizza` del cuerpo de la petición.
-   - Paso 2: mostrar un aviso en consola con esos datos.
-   - Paso 3: responder con un JSON de éxito con la forma indicada en la respuesta
-     esperada (más abajo) y borrar la respuesta temporal.
-4. Ejecuta el servicio en el puerto 3004:
-   ```text
-   node index.js
-   ```
-5. Prueba `POST /notificaciones` con `{ "pedidoId": 123, "pizza": "hawaiana" }`:
-
-   **PowerShell:**
-   ```text
-   curl.exe -X POST http://localhost:3004/notificaciones -H "Content-Type: application/json" -d '{\"pedidoId\":123,\"pizza\":\"hawaiana\"}'
-   ```
-   **Mac/Linux:**
-   ```text
-   curl -X POST http://localhost:3004/notificaciones -H "Content-Type: application/json" -d '{"pedidoId":123,"pizza":"hawaiana"}'
-   ```
-6. **Respuesta esperada:**
-   ```json
-   { "success": true, "message": "Notificación enviada para el pedido 123" }
-   ```
-7. Evidencia: captura del cuarto microservicio respondiendo.
-8. Responde la pregunta 6.
-
-### Integración al flujo
-
-Conecta notificaciones al flujo:
-`Cliente → Pedidos → Inventario → Pagos → Notificaciones → Pedido confirmado`.
-
-1. Con `servicio-notificaciones` corriendo en el 3004.
-2. En `microservicios/servicio-pedidos/index.js` cambia:
-   ```js
-   const NOTIFICACIONES_ACTIVAS = false;
-   ```
-   por:
-   ```js
-   const NOTIFICACIONES_ACTIVAS = true;
-   ```
-3. Guarda y reinicia `servicio-pedidos`.
-4. Realiza un pedido. La respuesta ahora incluye el bloque `notificacion`.
-5. Prueba adicional: detén `servicio-notificaciones` y realiza otro pedido. El
-   pedido se confirma igual; solo el campo `notificacion` indica que no se pudo
-   enviar el aviso.
-
----
-
-## Preguntas de análisis — Microservicios
-
-Responde en `respuestas/respuestas.md` con la misma numeración, según lo que
-hiciste y observaste.
-
-1. ¿Qué responsabilidad tiene cada microservicio?
-2. ¿Cómo se comunican?
-3. ¿Qué ocurre cuando un servicio deja de funcionar?
-4. ¿Qué ventajas observaste al separar el sistema?
-5. ¿Qué problemas puede generar tener varios servicios?
-6. ¿Qué aprendiste al crear servicio-notificaciones?
-
----
-
-## Serverless
-
-Objetivo: consumir una función que se ejecuta bajo demanda, sin mantener un
-servidor propio, y compararla con los microservicios anteriores.
-
-La función `funcion-pedido` recibe una pizza y devuelve un resumen del pedido con
-hora estimada de entrega.
-
-### Camino A — ejecutar la función localmente
-
-1. Arranca la simulación local:
-   ```text
-   cd serverless/funcion-pedido
-   node server-local.js
-   ```
-   Queda en `http://localhost:3005`.
-2. Realiza una petición:
-   ```text
-   curl.exe -X POST http://localhost:3005/ -H "Content-Type: application/json" -d '{\"pizza\":\"hawaiana\"}'
-   ```
-   (Mac/Linux: `curl -X POST http://localhost:3005/ -H "Content-Type: application/json" -d '{"pizza":"hawaiana"}'`)
-3. **Respuesta esperada:**
-   ```json
-   {
-     "success": true,
-     "pizza": "hawaiana",
-     "message": "Pedido de pizza hawaiana recibido por la funcion Serverless.",
-     "entregaEstimada": "...",
-     "ejecutadaEn": "..."
-   }
-   ```
-
-### Camino B — desplegar en Vercel (opcional)
-
-`index.js` es compatible con Vercel/Netlify y hay un `vercel.json` listo.
-
-```text
-npm install -g vercel
-cd serverless/funcion-pedido
-vercel
-```
-
-Al terminar obtienes una URL pública. Llámala igual que en el Camino A cambiando
-la dirección. Si usas este camino, anota tu URL en `respuestas/respuestas.md`.
-
-### Actividad — Serverless
-
-1. Ejecuta/prueba la función (Camino A o B).
-2. Realiza una petición.
-3. Cambia la pizza (por ejemplo a `pollo`).
-4. Repite la petición.
-5. Compara los resultados.
-6. Mide los tiempos de varias llamadas. En PowerShell:
-   ```text
-   Measure-Command { curl.exe -X POST http://localhost:3005/ -H "Content-Type: application/json" -d '{\"pizza\":\"pollo\"}' }
-   ```
-   Observa si los tiempos varían entre llamadas y regístralo. Las primeras
-   llamadas pueden tardar más que las siguientes.
-7. Evidencia: captura de la función respondiendo.
-8. Responde las preguntas 7 a 10.
-
----
-
-## Preguntas de análisis — Serverless
-
-7. ¿Qué es Serverless?
-8. ¿Qué diferencia observaste frente a los servicios locales?
-9. ¿Qué significa ejecutar una función bajo demanda?
-10. ¿Qué ventajas y limitaciones observaste?
-
----
-
-## API Gateway
-
-Contexto: hoy el cliente le pega directo a cada puerto (3001, 3002, 3003, 3004).
-Un **API Gateway** es un único punto de entrada: el cliente solo conoce
-`localhost:3000` y el gateway reenvía cada petición al servicio que corresponde.
-El cliente deja de saber cuántos servicios hay detrás.
-
-El gateway vive en `microservicios/gateway/` y escucha en el puerto 3000.
-
-### Lo que ya viene resuelto
-
-- El esqueleto del gateway (`index.js`), con la función `reenviar(...)` que proxea
-  peticiones, y las rutas de **pedidos** y **notificaciones** ya conectadas como
-  ejemplo.
-
-### Lo que completas tú (bloques `COMPLETAR` en `gateway/index.js`)
-
-Abre `gateway/index.js`. Las rutas de **pedidos** y **notificaciones** ya están
-resueltas: úsalas como modelo. Completa las partes marcadas con `COMPLETAR` (cada
-una lanza un error hasta que la resuelvas, para que se note lo que falta):
-
-1. **Las rutas de inventario y pagos.** Dentro de cada ruta, reenvía la petición
-   al servicio que corresponde usando la función `reenviar(...)`. El destino es la
-   URL del servicio (`URL_INVENTARIO` o `URL_PAGOS`) más la ruta pedida. Recuerda
-   que inventario tiene la ruta `/inventario/:pizza`, donde `:pizza` viene en la
-   URL. Fíjate en cómo lo hacen las rutas de pedidos y notificaciones.
-2. **Un middleware de logging** que imprima en consola el método y la ruta de cada
-   petición (por ejemplo: `[GATEWAY] POST /pedidos`). Pista de sintaxis: un
-   middleware de Express recibe `(req, res, next)` y al terminar debe llamar a
-   `next()` para dejar pasar la petición.
-
-### Actividad 6 — Probar todo a través del gateway
-
-1. Instala dependencias del gateway y ejecútalo:
-   ```text
-   cd microservicios/gateway
-   npm install
-   node index.js
-   ```
-2. Con los demás servicios corriendo, repite las pruebas del taller pero pegándole
-   siempre al **puerto 3000**, no a cada servicio por separado:
-   ```text
-   curl.exe -X POST http://localhost:3000/pedidos -H "Content-Type: application/json" -d '{\"pizza\":\"hawaiana\"}'
-   curl.exe http://localhost:3000/inventario
-   ```
-3. **Resultado esperado:** las respuestas son idénticas a cuando pegabas directo a
-   cada puerto, y en la terminal del gateway aparece tu log (`[GATEWAY] POST /pedidos`).
-4. Evidencia: captura de una petición pasando por el gateway y del log en consola.
-5. Responde la pregunta 15.
-
----
-
-## Comparación Microservicios vs Serverless
-
-Completa esta tabla en `respuestas/respuestas.md` con lo que observaste:
-
-| Característica | Microservicios | Serverless |
-|---|---|---|
-| Unidad principal | | |
-| Ejemplo del taller | | |
-| ¿Quién ejecuta el servicio? | | |
-| ¿Cuándo se ejecuta? | | |
-| Comunicación | | |
-| Infraestructura | | |
-| ¿Qué pudo observar el estudiante? | | |
-
-### Preguntas finales
-
-11. ¿Qué diferencia principal encontraste entre Microservicios y Serverless?
-12. ¿En qué situación utilizarías una arquitectura de Microservicios?
-13. ¿En qué situación utilizarías una función Serverless?
-14. ¿Qué fue lo más importante que aprendiste durante el taller?
-
----
-
-## Preguntas de análisis — API Gateway
-
-15. ¿Qué ventaja tiene que el cliente no sepa que hay varios servicios distintos
-    detrás del gateway?
-
----
-
-## Evidencias
-
-Incluye en el repositorio las capturas solicitadas:
-
-1. Los tres servicios corriendo (Actividad 1).
-2. Un pedido exitoso (Actividad 2).
-3. Un pedido rechazado por falta de inventario (Actividad 3).
-4. El error al detener un servicio (Actividad 4).
-5. El cuarto microservicio respondiendo (servicio-notificaciones).
-6. La función Serverless respondiendo.
-7. Una petición pasando por el gateway y su log en consola (Sección: API Gateway).
-
----
-
+ 
+## Preguntas del taller
+ 
+- **P1.** ¿Qué responsabilidad tiene cada servicio y cuál de ellos coordina el flujo?
+- **P2.** Describe paso a paso qué ocurre internamente cuando haces `POST /pedidos`.
+- **P3.** ¿Qué pasa con el pedido si `servicio-notificaciones` está apagado? ¿Por
+  qué `servicio-pedidos` lo trata distinto a inventario y pagos?
+- **P4.** ¿Qué ocurre si `servicio-pagos` está caído o rechaza el pago? ¿Qué pasa
+  con el stock y por qué?
+- **P5.** ¿Qué ocurre si `servicio-pagos` responde muy lento? ¿Qué problema de
+  consistencia puede aparecer y cómo se mitiga?
+- **P6.** ¿Qué ocurre si `servicio-inventario` está caído? ¿Por qué aquí no hay
+  nada que compensar?
+- **P7.** ¿Qué ventajas aporta el API Gateway? ¿Qué riesgo introduce?
+- **P8.** Compara la función Serverless con el microservicio de pedidos
+  (estado, escalado, costo, arranque en frío, límites).
+- **P9.** ¿Para qué parte de la pizzería usarías Serverless y para cuál
+  microservicios? Justifica.
+- **P10.** Menciona al menos cuatro mejoras para llevar este sistema a producción.
 ## Entrega
-
-### Entrega final
-
-Entrega el enlace del repositorio de GitHub. El repositorio debe contener:
-
-```text
-microservicios/
-├── servicio-pedidos/
-├── servicio-inventario/
-├── servicio-pagos/
-├── servicio-notificaciones/
-└── gateway/                
-
-serverless/
-└── funcion-pedido/
-
-respuestas/
-└── respuestas.md
-
-README.md
-```
-
-`respuestas.md` debe contener las respuestas a todas las preguntas de análisis y
-la tabla comparativa. Las evidencias solicitadas deben estar incluidas en el
-repositorio. No subas `node_modules/`.
-
+ 
+Completa `respuestas/respuestas.md` con tus observaciones (códigos HTTP,
+salidas de `curl` y conclusiones).
+ 

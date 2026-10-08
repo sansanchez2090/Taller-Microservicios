@@ -1,38 +1,31 @@
-// Servicio de notificaciones - puerto 3004
-// Lo completas tu. Faltan los pasos marcados como COMPLETAR.
-
-const express = require("express");
-
+// servicio-notificaciones (puerto 3004): envia (simula) mensajes al cliente.
+const express = require('express');
 const app = express();
 app.use(express.json());
 
-const PUERTO = 3004;
+const PORT = process.env.PORT || 3004;
+const CANALES = ['email', 'sms', 'whatsapp'];
+const enviadas = []; // historial en memoria
 
-app.post("/notificaciones", (req, res) => {
-  // COMPLETAR (Paso 1): leer pedidoId y pizza del body.
-  // const { pedidoId, pizza } = req.body;
+app.get('/health', (req, res) => res.json({ servicio: 'notificaciones', estado: 'ok' }));
 
-  // COMPLETAR (Paso 2): mostrar el aviso en consola.
-  // console.log(`[NOTIFICACIONES] Aviso: tu pedido ${pedidoId} de pizza ${pizza} esta confirmado.`);
-
-  // COMPLETAR (Paso 3): responder con exito y borrar la respuesta temporal de abajo.
-  // return res.json({
-  //   success: true,
-  //   message: `Notificacion enviada para el pedido ${pedidoId}`,
-  // });
-
-  // Respuesta temporal (borrala al terminar)
-  res.status(501).json({
-    success: false,
-    message:
-      "Este servicio todavia no esta completo. Sigue los pasos 'COMPLETAR' en index.js.",
-  });
+// Historial (opcionalmente filtrado por pedido: /notificaciones?pedidoId=1)
+app.get('/notificaciones', (req, res) => {
+  const { pedidoId } = req.query;
+  const lista = pedidoId ? enviadas.filter((n) => n.pedidoId === Number(pedidoId)) : enviadas;
+  res.json({ total: lista.length, notificaciones: lista });
 });
 
-app.get("/", (req, res) => {
-  res.json({ servicio: "notificaciones", estado: "ok", puerto: PUERTO });
+// Registrar/enviar una notificacion
+app.post('/notificaciones', (req, res) => {
+  const { pedidoId, mensaje, canal = 'email' } = req.body || {};
+  if (!pedidoId || !mensaje) return res.status(400).json({ error: 'pedidoId y mensaje son obligatorios' });
+  if (!CANALES.includes(canal)) return res.status(400).json({ error: `Canal invalido. Usa: ${CANALES.join(', ')}` });
+
+  const notificacion = { id: enviadas.length + 1, pedidoId: Number(pedidoId), mensaje, canal, enviada: new Date().toISOString() };
+  enviadas.push(notificacion);
+  console.log(`[notificaciones] (${canal}) pedido ${pedidoId}: ${mensaje}`);
+  res.status(201).json({ ok: true, notificacion });
 });
 
-app.listen(PUERTO, () => {
-  console.log(`[NOTIFICACIONES] Servicio de notificaciones escuchando en http://localhost:${PUERTO}`);
-});
+app.listen(PORT, () => console.log(`servicio-notificaciones escuchando en http://localhost:${PORT}`));

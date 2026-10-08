@@ -1,103 +1,90 @@
-// API Gateway - puerto 3000
-// Es el UNICO punto de entrada del sistema. El cliente le pega solo a este
-// servicio (localhost:3000) y el gateway reenvia cada peticion al microservicio
-// que corresponde. El cliente no necesita saber que detras hay 4 servicios
-// distintos en 4 puertos distintos.
-//
-// API Gateway del taller:
-//   - Las rutas de PEDIDOS y NOTIFICACIONES ya estan resueltas como ejemplo.
-//   - Tu completas las rutas de INVENTARIO y PAGOS siguiendo el mismo patron.
-//   - Tu agregas un middleware simple de logging (bloque COMPLETAR mas abajo).
-
-const express = require("express");
-
+// gateway (puerto 3000): punto de entrada unico.
+const express = require('express');
+const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-const PUERTO = 3000;
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || ''; // si se define, exige la cabecera x-api-key
+const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 5000);
+const LIMITE_POR_MINUTO = Number(process.env.LIMITE_POR_MINUTO || 60);
 
-// A donde vive cada microservicio.
-const URL_PEDIDOS = "http://localhost:3001";
-const URL_INVENTARIO = "http://localhost:3002";
-const URL_PAGOS = "http://localhost:3003";
-const URL_NOTIFICACIONES = "http://localhost:3004";
+const RUTAS = {
+  '/pedidos': process.env.URL_PEDIDOS || 'http://localhost:3001',
+  '/inventario': process.env.URL_INVENTARIO || 'http://localhost:3002',
+  '/pagos': process.env.URL_PAGOS || 'http://localhost:3003',
+  '/notificaciones': process.env.URL_NOTIFICACIONES || 'http://localhost:3004',
+};
 
-// -------------------------------------------------------------------
-// Middleware de logging
-// -------------------------------------------------------------------
+// --- Middleware: id de peticion + log ---
 app.use((req, res, next) => {
-  // COMPLETAR: registra en consola cada peticion que entra al gateway,
-  // mostrando el metodo y la ruta pedida (por ejemplo: "[GATEWAY] POST /pedidos").
-  // Pista: un middleware de Express recibe (req, res, next) y al terminar debe
-  // llamar a next() para dejar pasar la peticion.
-  throw new Error("COMPLETAR: falta el middleware de logging del gateway.");
+  req.id = req.headers['x-request-id'] || crypto.randomUUID().slice(0, 8);
+  res.setHeader('X-Request-Id', req.id);
+  const t0 = Date.now();
+  res.on('finish', () => console.log(`[gateway] ${req.id} ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - t0}ms)`));
+  next();
 });
 
-// -------------------------------------------------------------------
-// Funcion ayudante: reenvia (proxea) una peticion a un servicio destino
-// y devuelve al cliente exactamente lo que responda ese servicio.
-// -------------------------------------------------------------------
-async function reenviar(destino, req, res) {
-  try {
-    const opciones = {
-      method: req.method,
-      headers: { "Content-Type": "application/json" },
-    };
-    // Solo mandamos body en metodos que lo llevan.
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      opciones.body = JSON.stringify(req.body || {});
-    }
+// --- Middleware: rate limit en memoria (ventana de 1 minuto por IP) ---
+const ventanas = new Map();
+app.use((req, res, next) => {
+  const ahora = Date.now();
+  const v = ventanas.get(req.ip) || { inicio: ahora, n: 0 };
+  if (ahora - v.inicio > 60000) { v.inicio = ahora; v.n = 0; }
+  v.n += 1;
+  ventanas.set(req.ip, v);
+  if (v.n > LIMITE_POR_MINUTO) return res.status(429).json({ error: 'Demasiadas peticiones, intenta mas tarde' });
+  next();
+});
 
-    const respuesta = await fetch(destino, opciones);
-    const datos = await respuesta.json();
-    res.status(respuesta.status).json(datos);
-  } catch (error) {
-    console.log(`[GATEWAY] Error reenviando a ${destino}: ${error.message}`);
-    res.status(502).json({
-      success: false,
-      message: `El gateway no pudo contactar al servicio destino (${destino}).`,
-      detalle: error.message,
-    });
-  }
+// --- Middleware: autenticacion opcional por API key ---
+app.use((req, res, next) => {
+  if (!API_KEY || req.path === '/health' || req.path === '/') return next();
+  if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'API key invalida o ausente' });
+  next();
+});
+
+app.get('/', (req, res) => res.json({ gateway: 'pizzeria', rutas: Object.keys(RUTAS) }));
+
+// Salud agregada: consulta el /health de cada servicio
+app.get('/health', async (req, res) => {
+  const estados = {};
+  await Promise.all(Object.entries(RUTAS).map(async ([prefijo, base]) => {
+    try {
+      const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) });
+      estados[prefijo.slice(1)] = r.ok ? 'ok' : `error ${r.status}`;
+    } catch {
+      estados[prefijo.slice(1)] = 'caido';
+    }
+  }));
+  const todoOk = Object.values(estados).every((e) => e === 'ok');
+  res.status(todoOk ? 200 : 503).json({ gateway: 'ok', servicios: estados });
+});
+
+// --- Proxy por prefijo ---
+for (const [prefijo, base] of Object.entries(RUTAS)) {
+  app.use(prefijo, async (req, res) => {
+    const destino = base + req.originalUrl;
+    const tieneCuerpo = !['GET', 'HEAD'].includes(req.method);
+    try {
+      const resp = await fetch(destino, {
+        method: req.method,
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': req.id },
+        body: tieneCuerpo ? JSON.stringify(req.body ?? {}) : undefined,
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      const texto = await resp.text();
+      res.status(resp.status).type(resp.headers.get('content-type') || 'application/json').send(texto);
+    } catch (err) {
+      const timeout = err.name === 'TimeoutError' || err.name === 'AbortError';
+      res.status(timeout ? 504 : 502).json({
+        error: timeout ? 'Gateway Timeout: el servicio tardo demasiado' : 'Bad Gateway: servicio no disponible',
+        servicio: prefijo.slice(1),
+      });
+    }
+  });
 }
 
-// -------------------------------------------------------------------
-// Rutas proxeadas
-// -------------------------------------------------------------------
+app.use((req, res) => res.status(404).json({ error: 'Ruta no encontrada en el gateway' }));
 
-// PEDIDOS (RESUELTO, usalo de modelo)
-app.post("/pedidos", (req, res) => {
-  reenviar(`${URL_PEDIDOS}/pedidos`, req, res);
-});
-
-// NOTIFICACIONES (RESUELTO, usalo de modelo)
-app.post("/notificaciones", (req, res) => {
-  reenviar(`${URL_NOTIFICACIONES}/notificaciones`, req, res);
-});
-
-// INVENTARIO
-app.all("/inventario", (req, res) => {
-  // COMPLETAR: reenvia esta peticion a inventario usando reenviar().
-  // El destino es la URL de inventario mas la ruta /inventario.
-  throw new Error("COMPLETAR: falta proxear la ruta /inventario.");
-});
-app.all("/inventario/:pizza", (req, res) => {
-  // COMPLETAR: reenvia esta peticion a inventario usando reenviar(),
-  // incluyendo el nombre de la pizza que viene en la ruta.
-  throw new Error("COMPLETAR: falta proxear la ruta /inventario/:pizza.");
-});
-
-// PAGOS
-app.all("/pagos", (req, res) => {
-  // COMPLETAR: reenvia esta peticion a pagos usando reenviar().
-  // El destino es la URL de pagos mas la ruta /pagos.
-  throw new Error("COMPLETAR: falta proxear la ruta /pagos.");
-});
-
-app.get("/", (req, res) => {
-  res.json({ servicio: "gateway", estado: "ok", puerto: PUERTO });
-});
-
-app.listen(PUERTO, () => {
-  console.log(`[GATEWAY] API Gateway escuchando en http://localhost:${PUERTO}`);
-});
+app.listen(PORT, () => console.log(`gateway escuchando en http://localhost:${PORT}`));
